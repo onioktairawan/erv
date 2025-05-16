@@ -1,9 +1,10 @@
-import os
 import asyncio
-from telethon import TelegramClient, events, Button, errors, sync
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
+import os
+import re
 
 load_dotenv()
 
@@ -11,336 +12,159 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 MONGO_URI = os.getenv("MONGO_URI")
 
-# Database setup
-mongo_client = AsyncIOMotorClient(MONGO_URI)
-db = mongo_client["telethon_bot"]
-users_collection = db["users"]  # Simpan data user dan sesi
+# Setup MongoDB
+mongo = AsyncIOMotorClient(MONGO_URI)
+db = mongo["telethon_bot"]
+sessions_col = db["sessions"]
 
-# Inline keyboard tombol 3x3 (9 tombol)
-def main_keyboard():
-    return [
-        [
-            Button.inline("📊 Status", b"status"),
-            Button.inline("👥 Grup", b"group"),
-            Button.inline("📢 Channel", b"channel"),
-        ],
-        [
-            Button.inline("🛠 Operasi Massal", b"mass_leave"),
-            Button.inline("🚪 Leave Manual", b"leave_manual"),
-            Button.inline("🔒 Logout", b"logout"),
-        ],
-        [
-            Button.inline("ℹ️ Bantuan", b"help"),
-            Button.inline("📝 Info Bot", b"info"),
-            Button.inline("❌ Tutup", b"close"),
-        ]
-    ]
+# Main Bot Token (gunakan BotFather)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Helper: ambil client Telethon per user dari sesi string
-async def get_user_client(user_id):
-    user = await users_collection.find_one({"user_id": user_id})
-    if user and "session_str" in user:
-        try:
-            client = TelegramClient(StringSession(user["session_str"]), API_ID, API_HASH)
-            await client.start()
-            return client
-        except Exception as e:
-            print(f"Error membuka client user {user_id}: {e}")
-    return None
+# Buat dict untuk menyimpan state login per user
+login_state = {}
+clients = {}  # user_id: TelegramClient
 
-# Simpan sesi user ke DB
-async def save_session(user_id, session_str):
-    await users_collection.update_one(
-        {"user_id": user_id},
-        {"$set": {"session_str": session_str}},
-        upsert=True
-    )
+from telethon.sync import TelegramClient as SyncTelegramClient
+from telethon.sessions import StringSession as SyncStringSession
 
-# Hapus sesi user (logout)
-async def delete_session(user_id):
-    await users_collection.delete_one({"user_id": user_id})
+bot = TelegramClient("bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# Bot utama (pakai TelegramClient tanpa sesi karena hanya untuk menerima command dan mengelola sesi user)
-bot = TelegramClient('bot_session', API_ID, API_HASH)
+# State login user
+LOGIN_STEP = {
+    "WAITING_PHONE": 1,
+    "WAITING_CODE": 2,
+    "WAITING_PASSWORD": 3,
+}
 
-@bot.on(events.NewMessage(pattern='/start'))
+
+def clean_code(code):
+    return re.sub(r"\\s+", "", code)
+
+
+@bot.on(events.NewMessage(pattern="/start"))
 async def start(event):
-    sender = await event.get_sender()
-    user_id = sender.id
-    user = await users_collection.find_one({"user_id": user_id})
+    user_id = event.sender_id
+    session = await sessions_col.find_one({"user_id": user_id})
 
-    if user and "session_str" in user:
-        text = ("👋 Selamat datang kembali!\n\n"
-                "Kamu sudah login.\n\n"
-                "Gunakan tombol di bawah untuk mengakses fitur.")
-        await event.respond(text, buttons=main_keyboard())
+    if session:
+        await event.respond("\ud83d\udd13 Kamu sudah login. Pilih menu:", buttons=[
+            [
+                Button.inline("\ud83d\udcca Status", data="status"),
+                Button.inline("\ud83d\udcc6 Grup", data="grup"),
+                Button.inline("\ud83d\udcc4 Channel", data="channel")
+            ],
+            [
+                Button.inline("\u2696\ufe0f Operasi Massal", data="mass_leave"),
+                Button.inline("\u274c Leave Manual", data="leave_manual")
+            ]
+        ])
     else:
-        text = ("👋 Halo! Sebelum menggunakan bot ini, kamu harus login dulu.\n\n"
-                "Ketik nomor telepon kamu dengan format: +628123456789\n"
-                "Bot akan mengirim kode OTP untuk verifikasi.\n\n"
-                "Contoh:\n`+628123456789`")
-        await event.respond(text)
+        login_state[user_id] = LOGIN_STEP["WAITING_PHONE"]
+        await event.respond("\ud83d\udcf2 Masukkan nomor telepon kamu (contoh: +628123456789)")
 
-@bot.on(events.NewMessage(pattern=r'^\+\d{6,15}$'))
-async def login_start(event):
-    sender = await event.get_sender()
-    user_id = sender.id
-    phone = event.text.strip()
 
-    # Cek apakah user sudah login
-    user = await users_collection.find_one({"user_id": user_id})
-    if user and "session_str" in user:
-        await event.respond("Kamu sudah login. Gunakan /start untuk fitur.")
+@bot.on(events.NewMessage)
+async def handle_login(event):
+    user_id = event.sender_id
+    if user_id not in login_state:
         return
 
-    # Mulai proses login
-    temp_client = TelegramClient(StringSession(), API_ID, API_HASH)
+    step = login_state[user_id]
+    text = event.raw_text.strip()
 
-    try:
-        await temp_client.connect()
-        await temp_client.send_code_request(phone)
-    except errors.PhoneNumberInvalidError:
-        await event.respond("Nomor telepon tidak valid. Coba lagi.")
-        await temp_client.disconnect()
-        return
-    except Exception as e:
-        await event.respond(f"Error saat mengirim kode: {e}")
-        await temp_client.disconnect()
-        return
-
-    # Simpan nomor dan client sementara dalam konteks event (atau bisa di DB sementara, tapi disini simple simpan di dict)
-    if not hasattr(bot, 'login_sessions'):
-        bot.login_sessions = {}
-    bot.login_sessions[user_id] = {"client": temp_client, "phone": phone}
-
-    await event.respond("Kode OTP sudah dikirim ke nomor kamu.\n"
-                        "Kirim kode yang kamu terima sebagai pesan balasan.")
-
-@bot.on(events.NewMessage(pattern=r'^\d{4,6}$'))
-async def code_verification(event):
-    sender = await event.get_sender()
-    user_id = sender.id
-    code = event.text.strip()
-
-    if not hasattr(bot, 'login_sessions') or user_id not in bot.login_sessions:
-        # Tidak ada sesi login aktif
-        return
-
-    session = bot.login_sessions[user_id]
-    temp_client = session["client"]
-    phone = session["phone"]
-
-    try:
-        await temp_client.sign_in(phone=phone, code=code)
-    except errors.SessionPasswordNeededError:
-        await event.respond("Kamu punya 2FA, silakan kirim password kamu.")
-        # Tandai butuh password
-        session["need_2fa"] = True
-        return
-    except Exception as e:
-        await event.respond(f"Kode salah atau gagal login: {e}")
-        await temp_client.disconnect()
-        del bot.login_sessions[user_id]
-        return
-
-    # Login sukses
-    session_str = temp_client.session.save()
-    await save_session(user_id, session_str)
-    await event.respond("✅ Login berhasil! Gunakan /start untuk fitur.")
-    del bot.login_sessions[user_id]
-
-@bot.on(events.NewMessage())
-async def two_fa_handler(event):
-    sender = await event.get_sender()
-    user_id = sender.id
-    text = event.text.strip()
-
-    if not hasattr(bot, 'login_sessions') or user_id not in bot.login_sessions:
-        return
-
-    session = bot.login_sessions[user_id]
-    if "need_2fa" in session and session["need_2fa"]:
-        temp_client = session["client"]
+    if step == LOGIN_STEP["WAITING_PHONE"]:
+        phone = text
+        client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await client.connect()
         try:
-            await temp_client.sign_in(password=text)
+            await client.send_code_request(phone)
+            login_state[user_id] = LOGIN_STEP["WAITING_CODE"]
+            login_state[f"phone_{user_id}"] = phone
+            login_state[f"client_{user_id}"] = client
+            await event.respond("\ud83d\udd10 Masukkan kode OTP dengan spasi antar digit (contoh: 1 2 3 4 5 6)")
         except Exception as e:
-            await event.respond(f"Password salah atau gagal login: {e}")
-            await temp_client.disconnect()
-            del bot.login_sessions[user_id]
-            return
+            await event.respond(f"Gagal mengirim kode OTP: {e}")
 
-        session_str = temp_client.session.save()
-        await save_session(user_id, session_str)
-        await event.respond("✅ Login berhasil dengan 2FA! Gunakan /start untuk fitur.")
-        del bot.login_sessions[user_id]
-
-# Fungsi helper fitur utama, hanya bisa dipakai kalau user sudah login
-async def check_login(event):
-    sender = await event.get_sender()
-    user_id = sender.id
-    user = await users_collection.find_one({"user_id": user_id})
-    if not user or "session_str" not in user:
-        await event.respond("⚠️ Kamu harus login dulu. Kirim nomor telepon dengan format: +628123456789")
-        return None
-    client = await get_user_client(user_id)
-    if client is None:
-        await event.respond("⚠️ Gagal buka sesi Telegram, silakan login ulang dengan nomor telepon.")
-        await delete_session(user_id)
-        return None
-    return client
-
-@bot.on(events.CallbackQuery)
-async def callback_handler(event):
-    data = event.data.decode('utf-8')
-    sender = await event.get_sender()
-    user_id = sender.id
-
-    if data == "close":
-        await event.delete()
-        return
-
-    client = await check_login(event)
-    if client is None:
-        await event.answer("Login dulu ya!", alert=True)
-        return
-
-    if data == "status":
-        # Hitung total grup, channel, admin di grup
-        await event.answer("Mengambil data, tunggu sebentar...", alert=False)
-        dialogs = await client.get_dialogs()
-        total_groups = 0
-        total_channels = 0
-        total_admins = 0
-        admin_info = []
-
-        for d in dialogs:
-            if d.is_group:
-                total_groups += 1
-                # Cek admin di grup (hanya cek sendiri sebagai admin atau semua? Saya cek semua admin)
-                admins = []
-                try:
-                    async for participant in client.iter_participants(d.entity, filter=types.ChannelParticipantsAdmins):
-                        admins.append(participant)
-                except Exception:
-                    admins = []
-                total_admins += len(admins)
-                admin_info.append(f"{d.name}: {len(admins)} admin")
-            elif d.is_channel and not d.is_broadcast:
-                total_channels += 1
-
-        text = (
-            f"📊 <b>Status Akun</b>\n\n"
-            f"• Total Grup: {total_groups}\n"
-            f"• Total Channel: {total_channels}\n"
-            f"• Total Admin di Semua Grup: {total_admins}\n\n"
-            f"<b>Detail Admin per Grup:</b>\n" +
-            "\n".join(admin_info)
-        )
-        await event.edit(text, buttons=main_keyboard(), parse_mode="html")
-
-    elif data == "group":
-        dialogs = await client.get_dialogs()
-        groups = [d for d in dialogs if d.is_group]
-
-        if not groups:
-            await event.edit("❌ Kamu tidak tergabung di grup mana pun.", buttons=main_keyboard())
-            return
-
-        text = "<b>Daftar Grup Kamu:</b>\n\n"
-        for g in groups:
-            text += f"• {g.name} (ID: {g.id})\n"
-
-        await event.edit(text, buttons=main_keyboard(), parse_mode="html")
-
-    elif data == "channel":
-        dialogs = await client.get_dialogs()
-        channels = [d for d in dialogs if d.is_channel and not d.is_broadcast]
-
-        if not channels:
-            await event.edit("❌ Kamu tidak tergabung di channel mana pun.", buttons=main_keyboard())
-            return
-
-        text = "<b>Daftar Channel Kamu:</b>\n\n"
-        for c in channels:
-            text += f"• {c.name} (ID: {c.id})\n"
-
-        await event.edit(text, buttons=main_keyboard(), parse_mode="html")
-
-    elif data == "mass_leave":
-        # Mass leave: keluar dari semua grup sekaligus
-        dialogs = await client.get_dialogs()
-        groups = [d for d in dialogs if d.is_group]
-
-        if not groups:
-            await event.edit("❌ Tidak ada grup untuk di-leave.", buttons=main_keyboard())
-            return
-
-        count = 0
-        for g in groups:
-            try:
-                await client.delete_dialog(g.entity)
-                count += 1
-            except Exception:
-                pass
-
-        await event.edit(f"✅ Berhasil keluar dari {count} grup.", buttons=main_keyboard())
-
-    elif data == "leave_manual":
-        # Tampilkan daftar grup dengan tombol untuk leave manual 1 per 1
-        dialogs = await client.get_dialogs()
-        groups = [d for d in dialogs if d.is_group]
-
-        if not groups:
-            await event.edit("❌ Tidak ada grup untuk di-leave.", buttons=main_keyboard())
-            return
-
-        # Buat keyboard tombol leave grup satu-satu
-        buttons = []
-        for g in groups:
-            buttons.append([Button.inline(f"🚪 Leave {g.name}", f"leave_{g.id}")])
-        buttons.append([Button.inline("🔙 Kembali", "close")])
-
-        await event.edit("Pilih grup untuk keluar:", buttons=buttons)
-
-    elif data.startswith("leave_"):
-        # Leave manual grup spesifik
-        group_id = int(data.split("_")[1])
+    elif step == LOGIN_STEP["WAITING_CODE"]:
+        code = clean_code(text)
+        client = login_state.get(f"client_{user_id}")
+        phone = login_state.get(f"phone_{user_id}")
         try:
-            await client.delete_dialog(group_id)
-            await event.edit(f"✅ Berhasil keluar dari grup ID {group_id}", buttons=main_keyboard())
+            await client.sign_in(phone=phone, code=code)
+            string = client.session.save()
+            await sessions_col.update_one({"user_id": user_id}, {"$set": {"user_id": user_id, "session": string}}, upsert=True)
+            clients[user_id] = client
+            login_state.pop(user_id)
+            await event.respond("\ud83d\ude80 Berhasil login! Ketik /start untuk mulai.")
         except Exception as e:
-            await event.answer(f"Gagal keluar dari grup: {e}", alert=True)
+            if "password" in str(e).lower():
+                login_state[user_id] = LOGIN_STEP["WAITING_PASSWORD"]
+                await event.respond("\ud83d\udd10 Akun ini menggunakan verifikasi dua langkah. Masukkan password:")
+            else:
+                await event.respond(f"Gagal login: {e}")
 
-    elif data == "logout":
-        await delete_session(user_id)
-        await event.edit("🔒 Kamu sudah logout. Kirim /start untuk login ulang.", buttons=None)
+    elif step == LOGIN_STEP["WAITING_PASSWORD"]:
+        password = text
+        client = login_state.get(f"client_{user_id}")
+        try:
+            await client.sign_in(password=password)
+            string = client.session.save()
+            await sessions_col.update_one({"user_id": user_id}, {"$set": {"user_id": user_id, "session": string}}, upsert=True)
+            clients[user_id] = client
+            login_state.pop(user_id)
+            await event.respond("\ud83d\ude80 Berhasil login! Ketik /start untuk mulai.")
+        except Exception as e:
+            await event.respond(f"Password salah: {e}")
 
-    elif data == "help":
-        help_text = (
-            "📌 <b>Fitur Bot:</b>\n"
-            "• Status: Lihat total grup, channel, dan admin.\n"
-            "• Grup: Daftar grup yang kamu ikuti.\n"
-            "• Channel: Daftar channel yang kamu ikuti.\n"
-            "• Operasi Massal: Keluar dari semua grup sekaligus.\n"
-            "• Leave Manual: Keluar dari grup satu per satu.\n"
-            "• Logout: Keluar dari sesi login.\n\n"
-            "Login dulu dengan mengirim nomor telepon ya."
-        )
-        await event.edit(help_text, buttons=main_keyboard(), parse_mode="html")
 
-    elif data == "info":
-        info_text = (
-            "🤖 Bot ini dibuat dengan Telethon.\n"
-            "Login menggunakan nomor telepon Telegram kamu.\n"
-            "Semua sesi disimpan aman di MongoDB.\n"
-            "Gunakan tombol untuk navigasi fitur."
-        )
-        await event.edit(info_text, buttons=main_keyboard())
+# Callback untuk tombol inline
+from telethon.tl.functions.messages import GetDialogsRequest
+from telethon.tl.types import InputPeerEmpty, Channel, Chat
+from telethon.tl.functions.channels import GetParticipantsRequest
+from telethon.tl.types import ChannelParticipantsAdmins
+from telethon import Button
 
-async def main():
-    print("Bot berjalan...")
-    await bot.start()
-    await bot.run_until_disconnected()
+@bot.on(events.CallbackQuery(data=b"status"))
+async def status_handler(event):
+    user_id = event.sender_id
+    session = await sessions_col.find_one({"user_id": user_id})
+    if not session:
+        await event.answer("Belum login.", alert=True)
+        return
 
-if __name__ == '__main__':
-    asyncio.run(main())
+    client = TelegramClient(StringSession(session["session"]), API_ID, API_HASH)
+    await client.connect()
+
+    result = await client(GetDialogsRequest(
+        offset_date=None,
+        offset_id=0,
+        offset_peer=InputPeerEmpty(),
+        limit=200,
+        hash=0
+    ))
+
+    groups = [dialog for dialog in result.chats if isinstance(dialog, Chat)]
+    channels = [dialog for dialog in result.chats if isinstance(dialog, Channel)]
+
+    admin_groups = []
+    for g in groups:
+        try:
+            admins = await client(GetParticipantsRequest(
+                channel=g,
+                filter=ChannelParticipantsAdmins(),
+                offset=0,
+                limit=1,
+                hash=0
+            ))
+            for a in admins.users:
+                if a.id == (await client.get_me()).id:
+                    admin_groups.append(g)
+        except:
+            pass
+
+    await event.edit(f"\ud83d\udcca Status:\n- Total Grup: {len(groups)}\n- Total Channel: {len(channels)}\n- Admin di: {len(admin_groups)} grup")
+
+# Tambahan fitur 'grup', 'channel', 'mass_leave', 'leave_manual' bisa dilanjutkan sesuai pola di atas
+
+print("Bot berjalan...")
+bot.run_until_disconnected()
